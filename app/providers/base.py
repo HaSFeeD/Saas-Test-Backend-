@@ -37,7 +37,7 @@ class ProviderMatch:
 class SearchProvider(Protocol):
     """
     Pluggable data source. A real implementation must come from a legally vetted,
-    licensed data source (see PLAN.md, sections 7-8).
+    licensed data source.
     """
 
     name: str

@@ -161,4 +161,5 @@ Search results are produced by a deterministic **mock provider**: the same input
 yields the same output and no real person's data is involved. To plug in a real source,
 implement the `SearchProvider` interface in `app/providers`, register it in
 `app/providers/registry.py`, and set `SEARCH_PROVIDER`. The mock provider is rejected in
-production. See `PLAN.md` (sections 7–8) for the legal review a real data source requires.
+production. A real source must be a licensed, legally reviewed provider (GDPR, CCPA, BIPA,
+platform terms of service).
