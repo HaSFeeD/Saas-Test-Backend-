@@ -1,106 +1,93 @@
-# План: быстрый SaaS-бэкенд (по образцу cheaterbuster.com)
+# Architecture & plan — People Search API
 
-Цель: за один небольшой проект показать, как быстро поднимается production-ready бэкенд
-для SaaS «поиск по человеку → отчёт за деньги», и оставить основу, на которой можно
-запускать следующие проекты (меняется доменная часть, а каркас остаётся).
+## 1. Product
 
-## 1. Что делает продукт (модель CheaterBuster)
+A people-search SaaS (model: cheaterbuster.com).
 
-1. Пользователь регистрируется (с согласием на ToS).
-2. Запускает **поиск** (имя, возраст, город, опционально email/телефон/ник/фото).
-3. Поиск выполняется **асинхронно** (воркер опрашивает внешние источники).
-4. Пользователь сразу видит **превью-отчёт**: сколько совпадений, на каких платформах,
-   но данные скрыты (маска, без ссылок и фото). Это paywall.
-5. Чтобы открыть отчёт — тратит **1 кредит**. Кредиты покупаются пакетами
-   (разово) или приходят по **подписке** (ежемесячно).
-6. Отчёт открыт навсегда: профили, фото, уверенность совпадения.
+1. The user registers (with ToS consent).
+2. They start a **search** (name, age, city; optionally email/phone/username/photo).
+3. The search runs **asynchronously** (a worker queries the data provider).
+4. The user immediately sees a **preview**: how many matches, on which platforms — but the
+   data is hidden (masked, no links or photos). This is the paywall.
+5. To open the report they spend **1 credit**. Credits come from one-off **packs** or a
+   monthly **subscription**.
+6. An unlocked report stays open: profiles, photos, match confidence.
 
-## 2. Стек и почему
+## 2. Stack and why
 
-| Слой | Выбор | Причина |
+| Layer | Choice | Reason |
 |---|---|---|
-| Рантайм | Node 22 + TypeScript | быстрый старт, один язык с фронтом |
-| HTTP | Fastify 5 + zod | схемы = валидация + типы + OpenAPI из коробки |
-| БД | PostgreSQL | транзакции, JSONB, `SKIP LOCKED` для очереди |
-| Очередь | таблица `jobs` в Postgres | без Redis → меньше инфраструктуры, ACID вместе с данными |
-| Платежи | Stripe (Checkout + Webhooks + Portal) | стандарт для SaaS, подписки и пакеты |
-| Почта | интерфейс `Mailer` (console / Resend) | подмена без правок кода |
-| Файлы | интерфейс `Storage` (local / позже S3) | то же |
-| Деплой | `npm run build && npm start` + отдельный процесс воркера | любой Node-хостинг (VPS, Render, Railway, Fly) |
+| Runtime | Python 3.11+ | matches the role (Python automation + API work) |
+| HTTP API | FastAPI + Pydantic v2 | async, typed, OpenAPI out of the box |
+| DB | PostgreSQL (asyncpg) | transactions, JSONB, `SKIP LOCKED` for the queue |
+| Queue | `jobs` table in Postgres | no Redis → less infra, ACID with the data |
+| HTTP client | httpx (async) | retries, backoff, rate limits, proxy for all integrations |
+| Payments | Stripe REST (no SDK) | shows direct API work; checkout, portal, webhooks |
+| Messaging | Telegram Bot API | inbound webhook + outbound notifications |
+| Deploy | uvicorn + a worker process | any Python host (VPS, Render, Railway, Fly) |
 
-## 3. Архитектура
+## 3. Architecture
 
 ```
-Client ──HTTP──▶ Fastify API ──▶ PostgreSQL ◀── Worker (jobs: run_search, send_email)
-                    │                                    │
-                    ├─▶ Stripe (checkout / webhook)       └─▶ SearchProvider (интерфейс)
-                    └─▶ Storage (фото), Mailer
+Client ──HTTP/WS──▶ FastAPI ──▶ PostgreSQL ◀── Worker (run_search, send_email,
+                      │                                  deliver_webhook, notify_telegram)
+                      ├─▶ Stripe (checkout / webhook)
+                      ├─▶ Telegram (notify / inbound webhook)
+                      ├─▶ Outbound signed webhooks ─▶ customer endpoint
+                      └─▶ Storage (photos), Mailer
 ```
 
-Модули (`src/modules/*`): `auth`, `me` (профиль/экспорт/удаление), `billing`, `searches`,
-`uploads`, `privacy` (opt-out), `admin`. Каждый — плагин Fastify со своими роутами.
+Every outbound call goes through one async `HttpClient` with retries, exponential backoff,
+`Retry-After` handling and an optional egress proxy.
 
-Принципы:
-- **Деньги/кредиты только через леджер** (`credit_ledger`), баланс обновляется в одной
-  транзакции с записью; уникальный ключ `(reason, ref_id)` даёт идемпотентность.
-- **Webhooks идемпотентны** (таблица `webhook_events`).
-- **Провайдеры источников — за интерфейсом** `SearchProvider`; в репо есть `mock`.
-- Воркер можно запускать в том же процессе (`RUN_WORKER=true`) или отдельно (`npm run worker`).
+Principles:
+- **Money/credits only move through the ledger** (`credit_ledger`); the balance updates in the
+  same transaction as the ledger row, and the unique `(reason, ref_id)` key makes grants and
+  spends idempotent.
+- **Webhooks are idempotent** (the Stripe event id is stored in the same transaction as its
+  effects; outbound deliveries are retried by the queue).
+- **Data sources sit behind the `SearchProvider` interface**; a `mock` ships in the repo.
+- The worker can run in-process (`RUN_WORKER=true`) or as a separate process (`python worker.py`).
 
-## 4. Модель данных
+## 4. Data model
 
 `users`, `refresh_tokens`, `password_resets`, `credit_ledger`, `subscriptions`,
 `webhook_events`, `uploads`, `searches`, `search_results`, `jobs`, `opt_outs`.
 SQL: `migrations/001_init.sql`.
 
-## 5. API (v1)
+## 5. Integrations (the focus of this project)
 
-| Область | Эндпоинты |
+| Integration | What it demonstrates |
 |---|---|
-| Auth | `POST /auth/register`, `/auth/login`, `/auth/refresh`, `/auth/logout`, `/auth/forgot-password`, `/auth/reset-password` |
-| Me | `GET /me`, `GET /me/export`, `DELETE /me` |
-| Billing | `GET /billing/products`, `POST /billing/checkout`, `POST /billing/portal`, `POST /billing/webhook`, `GET /billing/ledger` |
-| Uploads | `POST /uploads` (multipart, фото), `GET /uploads/:id` |
-| Searches | `POST /searches`, `GET /searches`, `GET /searches/:id`, `POST /searches/:id/unlock` |
-| Privacy | `POST /privacy/opt-out`, `GET /privacy/opt-out/confirm` |
-| Admin | `GET /admin/stats`, `GET /admin/users`, `POST /admin/users/:id/credits` |
-| Ops | `GET /healthz`, `GET /readyz`, `GET /docs` (Swagger UI) |
+| `HttpClient` | retries, exponential backoff + jitter, `Retry-After`/429 handling, proxy, timeouts |
+| Stripe (REST) | bearer auth, form-encoded + bracket params, HMAC-SHA256 webhook verification, idempotency |
+| Telegram | messenger API: token-in-path, JSON bodies, secret-token header on inbound webhook |
+| Outbound webhooks | signing (`t=…,v1=HMAC`), delivery with retry via the job queue |
+| WebSocket | token-authenticated live status stream |
 
-## 6. Безопасность и соответствие
+## 6. Security & compliance
 
-- Пароли: scrypt + соль; JWT access (15 мин) + ротируемые refresh-токены (хранится только хеш).
-- Rate limit глобально и жёстче на auth; helmet; CORS по whitelist; redaction секретов в логах.
-- Валидация всех входов zod; загрузки — проверка MIME по сигнатуре и лимит размера.
-- Бесплатные поиски ограничены (по умолчанию 3 / 24 ч) — защита от злоупотреблений.
-- **Privacy by design** (для такого типа продукта обязательно):
-  - согласие с ToS при регистрации;
-  - публичный **opt-out** («удалите меня из результатов») с подтверждением по email;
-  - экспорт и удаление аккаунта (GDPR/CCPA);
-  - запросы по людям из opt-out блокируются.
+- Passwords: scrypt with a per-user salt; JWT access tokens (15 min) + rotating refresh
+  tokens (only the hash is stored; reuse revokes all sessions).
+- Rate limiting globally and tighter on auth/privacy; CORS allow-list; secrets kept out of logs.
+- All input validated with Pydantic; uploads checked by file signature with a size cap.
+- Free searches are capped per day — abuse protection.
+- **Privacy by design:** ToS consent at signup; public opt-out with e-mail confirmation;
+  data export and account deletion; searches for opted-out identifiers are blocked.
 
-## 7. Этапы и оценка (как делаем «быстро»)
+## 7. Next steps for a real launch
 
-| Этап | Содержимое | Статус |
-|---|---|---|
-| 0 | Каркас: конфиг, БД, миграции, ошибки, логи | ✅ |
-| 1 | Auth + me + privacy-эндпоинты | ✅ |
-| 2 | Кредиты, Stripe, подписки, webhooks | ✅ |
-| 3 | Очередь, воркер, поиск, paywall-отчёты, загрузка фото | ✅ |
-| 4 | Admin, OpenAPI, README | ✅ |
-| 5 | **Дальше (не входит в тестовый проект)** | ⏳ |
+1. **Real data provider** (`app/providers/`): choose a legally admissible source (a licensed
+   API / data broker, not scraping platforms against their ToS), pass legal review
+   (GDPR, CCPA, BIPA for biometrics/faces, platform ToS), implement `SearchProvider`.
+2. S3 storage for photos; antivirus/moderation on uploads.
+3. Real e-mail provider (Resend/SES) + templates; e-mail verification at signup.
+4. Observability (Sentry, Prometheus) and alerts on the queue and webhooks.
+5. Anti-fraud: captcha at signup, IP/card limits.
+6. CI/CD, staging, database backups.
 
-Этап 5 для боевого запуска:
-1. **Реальный провайдер данных** (`src/providers/`) — выбрать юридически допустимый источник
-   (лицензированный API/брокер данных, а не обход ToS площадок), пройти юр. проверку
-   (GDPR, CCPA, BIPA для биометрии/лиц, ToS площадок), реализовать `SearchProvider`.
-2. S3-хранилище для фото, антивирус/модерация загрузок.
-3. Email-провайдер (Resend/SES) + шаблоны, подтверждение email при регистрации.
-4. Sentry/метрики (Prometheus), алерты на очередь и webhooks.
-5. Антифрод: капча на регистрации, fingerprint, лимиты по IP/карте.
-6. CI/CD, staging, бэкапы БД.
+## 8. Out of scope here
 
-## 8. Что мы **не** делаем в этом проекте
-
-Скрапинг дейтинг-приложений и распознавание лиц по чужим фото не реализованы:
-это главный юридический и репутационный риск такого бизнеса и решается отдельно
-(см. п. 7.1). Бэкенд готов принять любой провайдер через интерфейс.
+Scraping dating apps and face recognition on third-party photos are **not** implemented:
+they are the main legal and reputational risk of this kind of business and are handled
+separately (see §7.1). The backend is ready to accept any provider through the interface.

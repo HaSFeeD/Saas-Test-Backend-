@@ -7,6 +7,9 @@ CREATE TABLE users (
   role               text NOT NULL DEFAULT 'user' CHECK (role IN ('user','admin')),
   credits            integer NOT NULL DEFAULT 0 CHECK (credits >= 0),
   stripe_customer_id text UNIQUE,
+  telegram_chat_id   text,
+  webhook_url        text,
+  webhook_secret     text,
   tos_accepted_at    timestamptz NOT NULL,
   created_at         timestamptz NOT NULL DEFAULT now(),
   deleted_at         timestamptz
@@ -90,21 +93,23 @@ CREATE TABLE searches (
 CREATE INDEX searches_user_idx ON searches (user_id, created_at DESC);
 
 CREATE TABLE search_results (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  search_id     uuid NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
-  platform      text NOT NULL,
-  profile_url   text NOT NULL,
-  display_name  text NOT NULL,
-  age           integer,
-  location      text,
-  photo_url     text,
-  confidence    real NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  search_id      uuid NOT NULL REFERENCES searches(id) ON DELETE CASCADE,
+  platform       text NOT NULL,
+  profile_url    text NOT NULL,
+  display_name   text NOT NULL,
+  username       text,
+  age            integer,
+  location       text,
+  photo_url      text,
+  confidence     real NOT NULL CHECK (confidence BETWEEN 0 AND 1),
   last_active_at timestamptz,
-  raw           jsonb
+  raw            jsonb
 );
 CREATE INDEX search_results_search_idx ON search_results (search_id);
 
--- Postgres-backed queue (FOR UPDATE SKIP LOCKED)
+-- Postgres-backed job queue (FOR UPDATE SKIP LOCKED). Used for searches,
+-- e-mail, outbound webhook delivery and Telegram notifications.
 CREATE TABLE jobs (
   id           bigserial PRIMARY KEY,
   type         text NOT NULL,
@@ -119,7 +124,7 @@ CREATE TABLE jobs (
 );
 CREATE INDEX jobs_pick_idx ON jobs (run_at) WHERE status = 'queued';
 
--- Right-to-be-forgotten list. Only hashes are stored.
+-- Right-to-be-forgotten list. Only keyed hashes of identifiers are stored.
 CREATE TABLE opt_outs (
   id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   kind          text NOT NULL CHECK (kind IN ('email','phone','username')),

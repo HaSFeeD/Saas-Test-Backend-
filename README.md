@@ -1,116 +1,164 @@
-# SaaS backend — «поиск по человеку → платный отчёт»
+# People Search API
 
-Тестовое задание: бэкенд для SaaS по модели cheaterbuster.com.
-Пользователь запускает поиск по человеку, сразу видит превью результатов, а полный отчёт открывает за кредит.
-Кредиты покупаются разовыми пакетами или приходят по подписке через Stripe.
+A production-grade backend for a people-search SaaS: a user runs a search for a person,
+sees a free preview of the matches, and unlocks the full report with credits. Credits are
+bought as one-off packs or granted by a monthly subscription through Stripe.
 
-План, архитектура и дальнейшие шаги описаны в **[PLAN.md](PLAN.md)**.
+The service is built around **third-party integrations and automation**: a hand-rolled Stripe
+REST client with HMAC webhook verification, a Telegram bot (inbound webhook + outbound
+notifications), signed outbound webhooks to customer endpoints, live search status over
+WebSocket, and a resilient async HTTP client (retries, backoff, rate-limit handling, proxy
+support) that every outbound call goes through.
 
-**Стек:** Node.js 22 · TypeScript · Fastify 5 · zod · PostgreSQL · Stripe.
-Очередь фоновых задач хранится в самом PostgreSQL, Redis не нужен.
+**Stack:** Python 3.11+ · FastAPI · asyncpg (PostgreSQL) · httpx · Pydantic v2 · PyJWT.
+Background jobs run on a Postgres-backed queue — no Redis or external broker required.
 
-## Что реализовано
+## Features
 
-- **Аутентификация:** регистрация с согласием на ToS, вход, JWT access-токены и ротация refresh-токенов (при повторном использовании старого токена закрываются все сессии), сброс пароля по email.
-- **Поиск:** асинхронный, выполняется воркером через очередь с ретраями. Бесплатно 3 поиска в сутки, для подписчиков 50.
-- **Paywall:** пока отчёт закрыт, видны число совпадений, платформы и замаскированные имена. Открытие стоит 1 кредит, повторное открытие ничего не списывает, отчёт без совпадений открывается бесплатно.
-- **Биллинг:** Stripe Checkout для пакетов (1, 5, 15 отчётов) и подписки Pro, вебхуки с проверкой подписи и защитой от повторной доставки, портал управления подпиской.
-- **Кредиты:** все движения записываются в журнал (`credit_ledger`). Уйти в минус или списать кредит дважды при параллельных запросах нельзя.
-- **Загрузка фото:** JPEG/PNG/WebP, тип проверяется по содержимому файла, фото видит только владелец.
-- **Приватность:** публичный запрос «исключите меня из поиска» с подтверждением по email, экспорт данных и удаление аккаунта (GDPR).
-- **Админка:** статистика, список пользователей, ручное начисление кредитов.
-- **Инфраструктура:** валидация конфигурации, миграции, rate limiting, helmet, CORS, единый формат ошибок, health-checks, OpenAPI/Swagger.
+- **Authentication** — register (with ToS consent), login, JWT access tokens, rotating
+  refresh tokens with reuse detection (a replayed token revokes every session), password
+  reset over e-mail.
+- **People search** — asynchronous, executed by a worker through a pluggable provider.
+  Free tier is rate-limited per day; subscribers get a higher daily cap.
+- **Paywall** — a locked report shows only match count, platforms and masked names
+  (`J****** S.`). Unlocking costs one credit; unlocking again is free, and a report with no
+  matches unlocks for free.
+- **Billing** — Stripe Checkout for packs and subscriptions, billing portal, and webhook
+  handling with signature verification and idempotent, replay-safe fulfilment.
+- **Credits ledger** — every balance change is journaled; balances cannot go negative and
+  concurrent spends cannot double-charge.
+- **Integrations**
+  - *Stripe* over the raw REST API (no SDK): customers, checkout, portal, subscription
+    cancel, and manual HMAC-SHA256 webhook verification.
+  - *Telegram Bot API*: inbound webhook (secret-token authenticated) and outbound search
+    notifications.
+  - *Outbound webhooks*: customers register an HTTPS endpoint and receive signed
+    `search.completed` events (`X-Webhook-Signature: t=…,v1=HMAC`).
+  - *WebSocket*: `ws /v1/ws/searches/{id}` streams live status until the search finishes.
+- **Photo uploads** — JPEG/PNG/WebP, validated by file signature (not the declared MIME),
+  private to the owner.
+- **Privacy** — public opt-out ("remove me") with e-mail confirmation; data export and
+  account deletion (GDPR).
+- **Operations** — config validation, per-route and global rate limiting, CORS, uniform
+  error envelope, health checks, and an OpenAPI schema served at `/docs`.
 
-## Запуск
+## Running locally
 
-Нужны Node.js 22+ и PostgreSQL 14+.
+Requires Python 3.11+ and PostgreSQL 14+.
 
 ```bash
 createdb saas
-cp .env.example .env     # задайте JWT_SECRET (не короче 32 символов) и DATABASE_URL
-npm install
-npm run dev              # миграции применяются при старте, воркер работает в том же процессе
+cp .env.example .env            # set JWT_SECRET (>= 32 chars) and DATABASE_URL
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+uvicorn asgi:app --reload       # migrations run automatically on startup
 ```
 
-После запуска откройте Swagger UI: http://localhost:3000/docs
+Open the interactive API docs at http://localhost:8000/docs
 
-Без `STRIPE_SECRET_KEY` включается dev-режим оплаты: checkout сразу начисляет кредиты.
-Поэтому весь сценарий можно пройти без аккаунта Stripe. В production без ключа сервис не запустится.
+Without `STRIPE_SECRET_KEY` the service uses a **dev billing provider**: checkout completes
+instantly and grants the credits, so the whole flow can be exercised without a Stripe account.
+In production the service refuses to start without a Stripe key.
 
-### Команды
+### Worker
 
-| Команда | Что делает |
-|---|---|
-| `npm run dev` | API и воркер с hot reload |
-| `npm run worker` | воркер отдельным процессом |
-| `npm run migrate` | применить миграции |
-| `npm run make-admin -- me@example.com` | выдать пользователю роль admin |
-| `npm run typecheck` | проверка типов |
-| `npm run build && npm start` | production-сборка и запуск |
-
-В production API и воркер удобно запускать отдельными процессами: API с `RUN_WORKER=false` и `node dist/worker.js`.
-
-## Сценарий через curl
+By default the worker runs in-process (`RUN_WORKER=true`). To scale it separately, set
+`RUN_WORKER=false` for the API and run the worker on its own:
 
 ```bash
-B=http://localhost:3000
+python worker.py
+```
+
+### Scripts
+
+| Command | Description |
+|---|---|
+| `uvicorn asgi:app --reload` | run the API (worker in-process) |
+| `python worker.py` | run the job worker standalone |
+| `python migrate.py` | apply database migrations |
+| `python make_admin.py user@example.com` | grant a user the admin role |
+| `ruff check app` | lint |
+
+## Example flow
+
+```bash
+B=http://localhost:8000
 TOKEN=$(curl -s -X POST $B/v1/auth/register -H 'content-type: application/json' \
   -d '{"email":"demo@example.com","password":"demo-password-1","acceptTerms":true}' | jq -r .accessToken)
 H="authorization: Bearer $TOKEN"
 
-# 1. Запустить поиск
+# 1. Start a search
 ID=$(curl -s -X POST $B/v1/searches -H "$H" -H 'content-type: application/json' \
   -d '{"firstName":"Jessica","lastName":"Smith","city":"Austin","age":29}' | jq -r .id)
 
-# 2. Превью: совпадения замаскированы
+# 2. Preview — matches are masked and locked
 curl -s $B/v1/searches/$ID -H "$H" | jq
 
-# 3. Купить пакет (в dev-режиме кредиты начисляются сразу)
+# 3. Buy a pack (dev mode grants credits immediately)
 curl -s -X POST $B/v1/billing/checkout -H "$H" -H 'content-type: application/json' -d '{"productId":"pack_1"}'
 
-# 4. Открыть полный отчёт за 1 кредит
+# 4. Unlock the full report for one credit
 curl -s -X POST $B/v1/searches/$ID/unlock -H "$H" | jq
 ```
 
-## API (`/v1`)
+## API
 
-| Раздел | Эндпоинты |
+All endpoints are under `/v1`. Errors use `{"error": {"code", "message", "details?"}}`.
+
+| Area | Endpoints |
 |---|---|
 | **auth** | `POST register · login · refresh · logout · forgot-password · reset-password` |
-| **me** | `GET /me` · `GET /me/export` · `DELETE /me` |
+| **me** | `GET /me` · `GET /me/export` · `DELETE /me` · `PUT/DELETE /me/webhook` · `POST /me/telegram/link` |
 | **billing** | `GET products` · `POST checkout` · `POST portal` · `GET ledger` · `POST webhook` |
-| **uploads** | `POST /uploads` (multipart, поле `file`) · `GET /uploads/:id` |
-| **searches** | `POST /` · `GET /` · `GET /:id` · `POST /:id/unlock` |
+| **uploads** | `POST /uploads` (multipart `file`) · `GET /uploads/{id}` |
+| **searches** | `POST /` · `GET /` · `GET /{id}` · `POST /{id}/unlock` |
 | **privacy** | `POST /privacy/opt-out` · `GET /privacy/opt-out/confirm` |
-| **admin** | `GET stats` · `GET users` · `POST users/:id/credits` |
+| **admin** | `GET stats` · `GET users` · `POST users/{id}/credits` |
+| **realtime** | `WS /v1/ws/searches/{id}?token=…` |
+| **telegram** | `POST /telegram/webhook` |
 
-Ошибки всегда приходят в формате `{ "error": { "code", "message", "details?" } }`.
-Полное описание запросов и ответов — в Swagger (`/docs`).
+See the full request/response schema in Swagger at `/docs`.
 
-## Подключение Stripe
+## Connecting Stripe
 
-1. Создайте в Stripe цены для четырёх продуктов и пропишите `STRIPE_SECRET_KEY` и `STRIPE_PRICE_*` в `.env`.
-2. Локально пробросьте вебхуки: `stripe listen --forward-to localhost:3000/v1/billing/webhook` и укажите выданный секрет в `STRIPE_WEBHOOK_SECRET`.
-3. Обрабатываемые события: `checkout.session.completed`, `checkout.session.async_payment_succeeded`, `invoice.paid`, `customer.subscription.created|updated|deleted`.
+1. Create Prices for the four products and set `STRIPE_SECRET_KEY` and `STRIPE_PRICE_*` in `.env`.
+2. Forward webhooks locally: `stripe listen --forward-to localhost:8000/v1/billing/webhook`,
+   and put the signing secret in `STRIPE_WEBHOOK_SECRET`.
+3. Events handled: `checkout.session.completed`, `checkout.session.async_payment_succeeded`,
+   `invoice.paid`, `customer.subscription.created|updated|deleted`.
 
-## Структура
+## Connecting Telegram
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and set `TELEGRAM_BOT_TOKEN`.
+2. Choose a `TELEGRAM_WEBHOOK_SECRET` and register the webhook so Telegram calls
+   `POST {PUBLIC_URL}/v1/telegram/webhook`.
+3. A user sends `/start` to the bot, gets their chat id, and links it via `POST /v1/me/telegram/link`.
+
+## Project layout
 
 ```
-src/
-  app.ts                сборка приложения; все зависимости передаются через Ctx
-  server.ts, worker.ts  точки входа API и воркера
-  config.ts             валидация переменных окружения
-  db.ts                 пул соединений, транзакции, миграции
-  jobs/                 очередь на PostgreSQL (SKIP LOCKED, ретраи с backoff) и обработчики задач
-  lib/                  журнал кредитов, криптография, ошибки, почта, хранилище файлов, хеширование PII
-  modules/<name>/       роуты и сервисы по доменам
-  providers/            интерфейс источника данных и mock-реализация
-migrations/             SQL-миграции
+app/
+  main.py              app factory, lifespan, dependency wiring
+  config.py            environment configuration (validated)
+  db.py                asyncpg pool, transactions, migrations
+  security.py          password hashing, tokens, JWT
+  deps.py              auth dependencies and rate limiting
+  errors.py            error types and handlers
+  credits.py           the credit ledger (the only place balances change)
+  pii.py               keyed hashing for opt-out identifiers
+  search_service.py    search execution, masking, report rendering
+  billing_*.py         products, Stripe event handling, fulfilment
+  jobs/                Postgres-backed queue, worker and job handlers
+  integrations/        http client, stripe, telegram, webhooks, mailer, storage
+  providers/           search-provider interface and a mock implementation
+  modules/             routers: auth, me, billing, uploads, searches, privacy, admin, ws, telegram
+migrations/            SQL migrations
 ```
 
-## Источник данных
+## Data source
 
-Сейчас результаты поиска выдаёт детерминированный mock-провайдер: одинаковый запрос даёт одинаковый ответ, реальных данных о людях нет.
-Чтобы подключить реальный источник, нужно реализовать интерфейс `SearchProvider` (`src/providers/types.ts`),
-зарегистрировать его в `src/providers/index.ts` и выставить `SEARCH_PROVIDER=<name>`. В production mock запустить нельзя.
-Перед подключением источник нужно проверить юридически (GDPR, CCPA, BIPA, условия площадок) — подробнее в PLAN.md, разделы 7–8.
+Search results are produced by a deterministic **mock provider**: the same input always
+yields the same output and no real person's data is involved. To plug in a real source,
+implement the `SearchProvider` interface in `app/providers`, register it in
+`app/providers/registry.py`, and set `SEARCH_PROVIDER`. The mock provider is rejected in
+production. See `PLAN.md` (sections 7–8) for the legal review a real data source requires.
